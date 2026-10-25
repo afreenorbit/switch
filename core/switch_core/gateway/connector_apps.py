@@ -43,7 +43,11 @@ from switch_core.connections.app_credentials import (
 )
 from switch_core.connections.broker import ServiceBroker, get_service_broker
 from switch_core.connections.loader import CATALOG
-from switch_core.connections.oauth_clients import core_callback
+from switch_core.connections.oauth_clients import (
+    LOOPBACK_REDIRECT_URI,
+    core_callback,
+    loopback_redirect,
+)
 from switch_core.db.audit import ServerAuditAction, record_server_audit_event
 from switch_core.db.models import (
     ServiceAppCredential,
@@ -166,9 +170,10 @@ def _refuse_while_blocked(spec: AppSpec, public_url: str | None) -> None:
 
 
 def _redirect(
-    spec: AppSpec, effective: EffectiveCredentials, public_url: str | None
+    spec: AppSpec, effective: EffectiveCredentials, apps: ConnectorApps
 ) -> str | None:
     """Where the vendor sends people back to Switch, for the operator to register."""
+    public_url = apps.public_url
     if spec.kind == "github_app":
         if effective.github_app is not None:
             return effective.github_app.connections.callback
@@ -177,7 +182,22 @@ def _redirect(
             if public_url is None or _setup_blocked(spec, public_url) is not None
             else public_url.rstrip("/") + GITHUB_CALLBACK_PATH
         )
-    return None if public_url is None else core_callback(public_url, spec.service)
+    return _oauth_redirect(apps, spec)
+
+
+def _oauth_redirect(apps: ConnectorApps, spec: AppSpec) -> str | None:
+    oauth = apps.definition(spec.service).auth.oauth
+    assert oauth is not None
+    for mode in oauth.redirect:
+        if mode == "core" and apps.public_url is not None:
+            return core_callback(apps.public_url, spec.service)
+        if mode == "loopback":
+            return (
+                loopback_redirect(oauth.loopback_ports[0])
+                if oauth.loopback_ports
+                else LOOPBACK_REDIRECT_URI
+            )
+    return None
 
 
 def _secret_views(
@@ -258,7 +278,7 @@ async def _entry(
         "saved_ignored": effective.saved_ignored,
         "unreadable": effective.unreadable,
         "load_error": effective.load_error,
-        "redirect_uri": _redirect(spec, effective, apps.public_url),
+        "redirect_uri": _redirect(spec, effective, apps),
         "setup_blocked": _setup_blocked(spec, apps.public_url),
         "install_url": (
             f"https://github.com/apps/{slug}/installations/new"
@@ -325,8 +345,14 @@ def _checks_body(result: CheckResult) -> list[dict[str, Any]]:
 
 
 async def _check(apps: ConnectorApps, spec: AppSpec, values: AppValues) -> CheckResult:
-    public_url = apps.public_url
-    if public_url is None:
+    redirect_uri = (
+        _oauth_redirect(apps, spec)
+        if spec.kind == "oauth_client"
+        else None
+        if apps.public_url is None
+        else core_callback(apps.public_url, spec.service)
+    )
+    if redirect_uri is None:
         raise HTTPException(
             409,
             "Set GATEWAY_PUBLIC_URL first: the vendor needs to know where to send "
@@ -338,7 +364,7 @@ async def _check(apps: ConnectorApps, spec: AppSpec, values: AppValues) -> Check
             spec,
             apps.definition(spec.service),
             values,
-            core_callback(public_url, spec.service),
+            redirect_uri,
         )
     except VendorUnreachableError as error:
         raise HTTPException(503, str(error)) from None
