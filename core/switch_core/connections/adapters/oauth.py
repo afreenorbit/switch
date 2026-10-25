@@ -26,8 +26,8 @@ import re
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Protocol
-from urllib.parse import urlencode, urlsplit
+from typing import Any, Literal, Protocol
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
 from fastmcp import Client
@@ -35,6 +35,7 @@ from fastmcp.client.transports import StreamableHttpTransport
 
 from switch_core.connections.adapters import (
     AccessToken,
+    ConnectionNotRevocable,
     ConnectionSecret,
     IssuedToken,
     IssueRequest,
@@ -45,6 +46,10 @@ from switch_core.connections.adapters import (
 from switch_core.connections.loader import AccessLevel, ConnectionDefinition
 
 MAX_METADATA_BYTES = 64 * 1024
+
+# How a client's secret goes with a token or revocation request (RFC 8414's
+# names): in the form body, or as HTTP Basic.
+ClientAuthentication = Literal["client_secret_post", "client_secret_basic"]
 
 _IDENTITY_DIAGNOSTICS: ContextVar[bool] = ContextVar(
     "mcp_identity_diagnostics", default=False
@@ -73,6 +78,9 @@ class OAuthClientCredentials:
 
     client_id: str
     client_secret: str | None = field(repr=False)
+    # How the secret goes, where the client's registration says; None to send
+    # it as the vendor's endpoints take it.
+    authentication: ClientAuthentication | None
 
 
 @dataclass(frozen=True)
@@ -87,6 +95,23 @@ class AuthorizationEndpoints:
     # `resource` of every authorization and token request (RFC 8707). None
     # where the catalog names the endpoints.
     resource: str | None
+    client_authentication: ClientAuthentication
+
+
+def client_fields(
+    endpoints: AuthorizationEndpoints, client: OAuthClientCredentials
+) -> tuple[dict[str, str], dict[str, str]]:
+    """The form fields and headers a request to the token or revocation
+    endpoint identifies the client with."""
+    form = {"client_id": client.client_id}
+    if client.client_secret is None:
+        return form, {}
+    authentication = client.authentication or endpoints.client_authentication
+    if authentication == "client_secret_basic":
+        # Each half form-urlencoded first (RFC 6749 §2.3.1).
+        pair = f"{quote(client.client_id, safe='')}:{quote(client.client_secret, safe='')}".encode()
+        return form, {"Authorization": f"Basic {base64.b64encode(pair).decode()}"}
+    return {**form, "client_secret": client.client_secret}, {}
 
 
 class ClientSource(Protocol):
@@ -270,6 +295,7 @@ class OAuthAdapter:
                 registration=None,
                 revocation=None,
                 resource=None,
+                client_authentication="client_secret_post",
             )
             return self._endpoints
         mcp_url = self._mcp_url
@@ -327,6 +353,17 @@ class OAuthAdapter:
             )
         registration = metadata.get("registration_endpoint")
         revocation = metadata.get("revocation_endpoint")
+        # The form body, unless the vendor takes a secret only as HTTP Basic:
+        # Airtable refuses one in the body. Metadata that lists no methods
+        # means Basic (RFC 8414 §2).
+        auth_methods = metadata.get(
+            "token_endpoint_auth_methods_supported", ["client_secret_basic"]
+        )
+        basic_only = (
+            isinstance(auth_methods, list)
+            and "client_secret_basic" in auth_methods
+            and "client_secret_post" not in auth_methods
+        )
         self._endpoints = AuthorizationEndpoints(
             authorization=_https(
                 metadata.get("authorization_endpoint"), "authorization endpoint"
@@ -343,6 +380,9 @@ class OAuthAdapter:
                 else _https(revocation, "revocation endpoint")
             ),
             resource=_https(resource.get("resource", mcp_url), "resource identifier"),
+            client_authentication=(
+                "client_secret_basic" if basic_only else "client_secret_post"
+            ),
         )
         return self._endpoints
 
@@ -383,9 +423,8 @@ class OAuthAdapter:
     async def _token_request(self, form: dict[str, str]) -> TokenAnswer:
         endpoints = await self.endpoints()
         client = await self._client.credentials(endpoints)
-        data = {**form, "client_id": client.client_id}
-        if client.client_secret is not None:
-            data["client_secret"] = client.client_secret
+        identifying, headers = client_fields(endpoints, client)
+        data = {**form, **identifying}
         if endpoints.resource is not None:
             data["resource"] = endpoints.resource
         response = await self._send(
@@ -393,7 +432,7 @@ class OAuthAdapter:
                 "POST",
                 endpoints.token,
                 data=data,
-                headers={"Accept": "application/json"},
+                headers={"Accept": "application/json", **headers},
             )
         )
         if response.status_code == 200:
@@ -608,6 +647,11 @@ class OAuthAdapter:
         )
 
     async def revoke_connection(self, secret: ConnectionSecret) -> None:
+        if self._oauth.revocation_url is None and not self._oauth.revocation_discovered:
+            raise ConnectionNotRevocable(
+                f"Switch has stopped using the {self._name} sign-in but cannot "
+                f"revoke it, so it still works. {self._oauth.remove_access}"
+            )
         endpoints = await self.endpoints()
         url = (
             endpoints.revocation
@@ -627,10 +671,15 @@ class OAuthAdapter:
         if token is None:
             return
         client = await self._client.credentials(endpoints)
-        data = {"token": token, "token_type_hint": hint, "client_id": client.client_id}
-        if client.client_secret is not None:
-            data["client_secret"] = client.client_secret
-        response = await self._send(self._http.build_request("POST", url, data=data))
+        identifying, headers = client_fields(endpoints, client)
+        response = await self._send(
+            self._http.build_request(
+                "POST",
+                url,
+                data={"token": token, "token_type_hint": hint, **identifying},
+                headers=headers,
+            )
+        )
         # RFC 7009: a token the server no longer knows is answered 200, but
         # some answer invalid_token; either way it is gone.
         if response.status_code == 200:

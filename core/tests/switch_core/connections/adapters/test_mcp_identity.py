@@ -132,7 +132,9 @@ def _adapter(http):
     }
     return OAuthAdapter(
         ConnectionDefinition.model_validate(entry),
-        StaticClient(OAuthClientCredentials("example-client", None)),
+        StaticClient(
+            OAuthClientCredentials("example-client", None, authentication=None)
+        ),
         http,
     )
 
